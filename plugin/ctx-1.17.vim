@@ -1,11 +1,15 @@
 " ctx.vim -- display current scope context of cursor in a C file          "
+" Maintainer: Chris Houser <chouser@bluweb.com>                           "
 " Copyright (C) Sept 2001 - Feb 2002, Aaron Brooks and Chris Houser       "
 " Distributed under the GNU General Public License                        "
-" $Revision: 1.16 $                                                       "
+" $Revision: 1.17 $                                                  "
+" For updates, see http://www.bluweb.com/us/chouser/proj/ctx/             "
 
-
-" To use, source this file in your ~/.vimrc.  You may also want to reduce "
-" your updatetime to 1000 or so.                                          "
+" To use, source this file in your ~/.vimrc. To change any of the default "
+" settings below, set them *after* you source this file.                  "
+"                                                                         "
+" You may also want to set the updatetime in your ~/.vimrc to 1000 or so: "
+"       :set updatetime 1000                                              "
 
 " Note that if you source this file from within an autocommand, you may   "
 " get a non-fatal error when opening a C file.                            "
@@ -14,14 +18,17 @@
 let CTX_lncols=5        " num of cols in context win for line numbers     "
 let CTX_reindent=2      " how deep each level indents (in spaces)         "
 let CTX_autohide=1      " autoclose context win when last C buffer closes "
+let CTX_autoupdate=1    " update the context buf on CursorHold            "
 let CTX_minrows=0       " minimum num of rows for context win             "
 let CTX_maxrows=20      " maximum num of rows for context win             "
 let CTX_seetop=1        " always see the top of the context buf? BROKEN   "
 let CTX_debug=0
 
-let CTX_minrows=4
-let CTX_maxrows=4
-let CTX_seetop=0
+" Only load once. Let loaded_ctx = 1 in your ~/.vimrc to never load at all"
+if exists("loaded_ctx")
+    finish
+endif
+let loaded_ctx = 1
 
 perl << ENDPERL
 ########
@@ -92,7 +99,7 @@ BEGIN {
             my $line = $rec->[0];
             $line =~ s/\s+/ /g;
             $line =~ s/^\s*//;
-            ++$depth unless $line =~ /^else/;
+            ++$depth unless $line =~ /^else|:$/;
             my $indent = " " x ($reindent * $depth);
             if ($lncols) {
                 appendmsg sprintf "%${lncols}d:%s%s", $rec->[1], $indent, $line;
@@ -101,14 +108,14 @@ BEGIN {
                 appendmsg $indent . $line;
             }
         }
-        $outbuf->Delete(1);
+        $outbuf->Delete(1) if $outbuf->Count();
         # trivial detection of non-function
         (@slines && $slines[0] =~ /\(.*\)/) and bclear;
         # adjust context buffer
         my $height = $outbuf->Count();
         ($height > $maxrows) and $height = $maxrows;
         ($height < $minrows) and $height = $minrows;
-        $outwin->SetHeight($height);
+        $outwin and $outwin->SetHeight($height);
         if (! $seetop) {
             # how to scroll the output buffer down??
         }
@@ -125,15 +132,24 @@ sub init {
     $maxrows  = VIM::Eval('g:CTX_maxrows');
     $seetop   = VIM::Eval('g:CTX_seetop');
 
-    # find our output buffer (and output window) and clear it
+    # find our output buffer and clear it
+    $outwin = 0;
     ($outbuf) = VIM::Buffers('--context--');
+    if (!defined $outbuf) {
+        VIM::Msg("ctx: Unexpected loss of context buffer");
+        $lnum = 1;
+        return;
+    }
+    $outbuf->Delete(1, $outbuf->Count());
+
+    # find our output window for use later
     foreach my $win (VIM::Windows()) {
-        if ($win->Buffer() == $outbuf) {
+        my $buf = $win->Buffer() || -1;
+        if ($buf == $outbuf) {
             $outwin = $win;
             last;
         }
     }
-    $outbuf->Delete(1, $outbuf->Count());
 
     # find our current cursor position (in rows and columns)
     my ($row, $col) = $main::curwin->Cursor();
@@ -217,6 +233,7 @@ sub run {
     my $parend  = 0; # parenthesis depth
     my $elsed   = 1; # else depth
     my $gotbrace= 0; # indicates the ctrl statement being parsed preceded braces
+    my $gotlabel= 0; # we've seen a label at this brace depth
     my $comment = 0; # 1 == the start of previous line was in a block comment
     my $lvl     = 0; # level of brace depth, counting up from cursor location
 
@@ -235,8 +252,18 @@ sub run {
         }
         ($oldl, $old_, $olds) = ($CTX::lnum, $_, $state);
 
-        # comments
+        # handle line continuations by peeking at previous line
+        my $prevline = $main::curbuf->Get($CTX::lnum - 1);
+        if (defined $prevline && $prevline =~ s/\\$//) {
+            # combine this line with the previous and go 'round again
+            --$CTX::lnum;
+            $_ = $prevline . $_;
+            next;
+        }
+
+        # comments and strings
         s{^[#]         .*$}{}x;  # for now, clobber #directives
+        s{    " .*? " \s* }{}gx;
         s{   /\*.*?\*/\s* }{}gx;
         s{   //        .*$}{}x;
         s{^.*      \*/\s*$}{}x   and do { $comment = 1; next };
@@ -246,26 +273,31 @@ sub run {
         # state machine
         PRECTRL and do {
             $gotbrace = 0;
-            s/\bdo\s*$//        and do { bdo $&; next};
-            s/\belse    \s*$//x and do { bdopre $&; goELSE; next };
-            s/[;{}][^;{})]*$//x and do { $_.=$&; goBRACE; next };
-            s/[)]  [^)]*   $//x and do { badd $&; $parend=1; goPAREN; next };
+            s/\bdo\s*$//x         and do { bdo $&; next};
+            s/\belse      \s*$//x and do { bdopre $&; goELSE; next };
+            !$gotlabel && $braced==1 && s/^\s*((case\s+)?\w+\s*:)[^:{}]*$//x and
+                do { bdo $1; $gotlabel=1; next};
+            s/[;{}][^:;{})] *$//x and do { $_.=$&; goBRACE; next };
+            s/[)]  [^)]*     $//x and do { badd $&; $parend=1; goPAREN; next };
         };
 
         PREBRACE and do {
             $gotbrace = 1;
+            $gotlabel = 0;
             s/\bdo\s*$// and do {bdo $& . CTXFWD::dowhile($lvl);goPRECTRL;next};
-            s/\belse    \s*$//x and do { bdo $&; goELSE; next };
-            s/[;{}][^;{})]*$//x and do { bdo '{'; $_.=$&; goBRACE; next };
-            s/[)]  [^)]*   $//x and do { badd $&; $parend=1; goPAREN; next };
+            s/\belse      \s*$//x and do { bdo $&; goELSE; next };
+            s/[;:{}][^;:{})]*$//x and do { bdo '{'; $_.=$&; goBRACE; next };
+            s/[)]  [^)]*     $//x and do { badd $&; $parend=1; goPAREN; next };
         };
 
         BRACE ||
         EBRACE and do {
             BRACE  && $braced==0 and do { $braced=1;++$lvl;bln;goPREBRACE;next};
             EBRACE && $braced==0 and do { $braced=1; goPREELSE;  next };
-            s/}[^{}]*$//x        and do { ++$braced; next };
-            s/{[^{}]*$//x        and do { --$braced; next };
+            !$gotlabel && $braced==1 && s/^\s*((case\s+)?\w+\s*:)[^:{}]*$//x and
+                do { bdo $1; $gotlabel=1; next};
+            s/}[^{}:]*$//x        and do { ++$braced; next };
+            s/{[^{}:]*$//x        and do { --$braced; next };
         };
 
         ELSE and do {
@@ -318,9 +350,8 @@ sub run {
 ENDPERL
 
 " automatically close --context-- buffer when last C buffer goes away. "
-" frigging hard to do!  Is there a better way, I hope? "
-function! CTXHide()
-    if g:CTX_autohide
+function! s:autohide()
+    if g:CTX_autohide && bufloaded('--context--') > 0
         let start = winnr()
         let foundc = 0
         while 1
@@ -333,35 +364,75 @@ function! CTXHide()
             endif
         endwhile
         if foundc < 1
-            while 1
-                if bufname('%') == '--context--'
-                    q
-                    break
-                endif
-                wincmd w
-                if winnr() == start
-                    break
-                endif
-            endwhile
+            call s:hide()
         endif
     endif
 endfunction
 
+" move the cursor to a named buffer "
+function! s:gotobuf(buf)
+    let start = winnr()
+    while bufname('%') != a:buf
+        wincmd w
+        if winnr() == start
+            echomsg "Couldn't find " . a:buf
+            return -1
+        endif
+    endwhile
+endfunction
+
+" close the context buffer "
+function! s:hide()
+    let start = bufname('%')
+    if start == '--context--'
+        q!
+    else
+        if s:gotobuf('--context--') == 0
+            q!
+        endif
+        call s:gotobuf(start)
+    endif
+endfunction
+
+" toggle the context buffer on and off "
+function! s:toggle()
+    if bufloaded('--context--') > 0
+        let g:CTX_autoupdate = 0
+        call s:hide()
+    else
+        let g:CTX_autoupdate = 1
+        call s:update()
+    endif
+endfunction
+
 " main function "
-function! CTXUpdate()
-    if bufnr('--context--') < 0
+function! s:update()
+    if bufloaded('--context--') == 0
+        let start = bufname('%')
         topleft new --context--
         set filetype=c nowrap buftype=nofile bufhidden=delete noswapfile
-        exe "normal! \<C-W>p"
+        call s:gotobuf(start)
     endif
 
     perl CTXBACK::run;
 endfunction
 
+" called at every CursorHold even "
+function! s:cursorhold()
+    if g:CTX_autoupdate
+        call s:update()
+    endif
+endfunction
+
 augroup CTX
     au!
-    au CursorHold  *.[cC] call CTXUpdate()
-    au BufEnter    *      call CTXHide()
+    au CursorHold  *.[cC] call <SID>cursorhold()
+    au BufEnter    *      call <SID>autohide()
 augroup END
+
+noremap <Plug>toggle :call <SID>toggle()<CR>
+if !hasmapto ('<Plug>toggle')
+    map <unique> \c <Plug>toggle
+endif
 
 " vim: filetype=perl
