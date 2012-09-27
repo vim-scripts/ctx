@@ -30,6 +30,10 @@ if exists("loaded_ctx")
 endif
 let loaded_ctx = 1
 
+if !has('perl') && !&verbose
+    finish
+endif
+
 perl << ENDPERL
 ########
 # CTX main package
